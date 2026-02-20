@@ -1,58 +1,56 @@
 import os
+import json
 import asyncio
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from flask import Flask, request
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
 
-# جلب المفاتيح
+# الإعدادات
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-client = Groq(api_key=GROQ_API_KEY)
+URL = "https://asoap-bot.onrender.com" # تأكد أن هذا رابطك في Render
 
-# سيرفر بسيط لإرضاء Render
-class SimpleHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is Live!")
+# تهيئة الأدوات
+app = Flask(__name__)
+groq_client = Groq(api_key=GROQ_API_KEY)
+tg_application = Application.builder().token(TOKEN).build()
 
-def run_health_check():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
-    server.serve_forever()
+async def get_groq_response(text):
+    completion = groq_client.chat.completions.create(
+        messages=[{"role": "user", "content": text}],
+        model="llama3-8b-8192",
+    )
+    return completion.choices[0].message.content
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text: return
-    try:
-        completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": update.message.text}],
-            model="llama3-8b-8192",
-        )
-        await update.message.reply_text(completion.choices[0].message.content)
-    except Exception as e:
-        print(f"Error: {e}")
+@app.route(f'/{TOKEN}', methods=['POST'])
+async def webhook(update: Update):
+    """معالجة التحديثات القادمة من تليجرام"""
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), tg_application.bot)
+        
+        if update.message and update.message.text:
+            user_text = update.message.text
+            response_text = await get_groq_response(user_text)
+            await update.message.reply_text(response_text)
+            
+        return "ok", 200
 
-async def main():
-    # تشغيل السيرفر في خيط منفصل
-    threading.Thread(target=run_health_check, daemon=True).start()
-    
-    # بناء وتشغيل البوت
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    
-    print("Bot is starting...")
-    async with app:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling()
-        # إبقاء البوت يعمل للأبد
-        while True:
-            await asyncio.sleep(100)
+@app.route('/')
+def index():
+    return "ASOAP Engine is Running!", 200
+
+async def setup_webhook():
+    """إخبار تليجرام بمكان السيرفر"""
+    bot = Bot(token=TOKEN)
+    await bot.set_webhook(url=f"{URL}/{TOKEN}")
+    print(f"Webhook set to: {URL}/{TOKEN}")
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    # تشغيل تهيئة الـ Webhook في الخلفية
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(setup_webhook())
+    
+    # تشغيل سيرفر Flask
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
