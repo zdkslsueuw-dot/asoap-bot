@@ -1,56 +1,48 @@
 import os
-import json
 import asyncio
-from flask import Flask, request
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from groq import Groq
 
-# الإعدادات
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# 1. جلب المفاتيح
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-URL = "https://asoap-bot.onrender.com" # تأكد أن هذا رابطك في Render
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+client = Groq(api_key=GROQ_API_KEY)
 
-# تهيئة الأدوات
-app = Flask(__name__)
-groq_client = Groq(api_key=GROQ_API_KEY)
-tg_application = Application.builder().token(TOKEN).build()
+# 2. سيرفر بسيط لإرضاء Render
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive")
 
-async def get_groq_response(text):
-    completion = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": text}],
-        model="llama3-8b-8192",
-    )
-    return completion.choices[0].message.content
-
-@app.route(f'/{TOKEN}', methods=['POST'])
-async def webhook(update: Update):
-    """معالجة التحديثات القادمة من تليجرام"""
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), tg_application.bot)
-        
-        if update.message and update.message.text:
-            user_text = update.message.text
-            response_text = await get_groq_response(user_text)
-            await update.message.reply_text(response_text)
-            
-        return "ok", 200
-
-@app.route('/')
-def index():
-    return "ASOAP Engine is Running!", 200
-
-async def setup_webhook():
-    """إخبار تليجرام بمكان السيرفر"""
-    bot = Bot(token=TOKEN)
-    await bot.set_webhook(url=f"{URL}/{TOKEN}")
-    print(f"Webhook set to: {URL}/{TOKEN}")
-
-if __name__ == '__main__':
-    # تشغيل تهيئة الـ Webhook في الخلفية
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(setup_webhook())
-    
-    # تشغيل سيرفر Flask
+def run_server():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    httpd = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    httpd.serve_forever()
+
+# 3. معالجة الرسائل
+async def respond(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: return
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": update.message.text}],
+            model="llama3-8b-8192",
+        )
+        await update.message.reply_text(chat_completion.choices[0].message.content)
+    except Exception as e:
+        print(f"Groq Error: {e}")
+
+# 4. المحرك الرئيسي
+if __name__ == '__main__':
+    # تشغيل السيرفر في خيط منفصل فوراً
+    threading.Thread(target=run_server, daemon=True).start()
+    
+    # بناء البوت بنظام الـ Polling البسيط
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), respond))
+    
+    print("ASOAP Bot Started...")
+    app.run_polling()
